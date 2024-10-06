@@ -541,6 +541,14 @@ class ProtocolPayload:
         return ProtocolPayload(header, payload_type, values)
 
     def __repr__(self):
+        def format_value(field):
+            if isinstance(field.value, int):
+                return f" 0x{field.value:0{2*field.length}x}"
+            elif isinstance(field.value, bytes):
+                return f" 0x{field.value.hex()}"
+            else:
+                return f" {str(field.value):<{4*field.length-1}}"
+
         header_separators = [
             "-" * (4 * field.length + 2) for field in self.header.fields
         ]
@@ -562,10 +570,11 @@ class ProtocolPayload:
         type_value = [
             f" 0x{hexlify(int(PayloadType(self.payload_type).value).to_bytes(1, 'big')).decode():<3}"
         ]
-        values_values = [
-            f" 0x{hexlify(int(field.value).to_bytes(field.length, 'big', signed=field.signed)).decode():<{4 * field.length - 1}}"
-            for field in self.values.fields
-        ]
+        # values_values = [
+        #     f" 0x{hexlify(int(field.value).to_bytes(field.length, 'big', signed=field.signed)).decode():<{4 * field.length - 1}}"
+        #     for field in self.values.fields
+        # ]
+        values_values = [format_value(field) for field in self.values.fields]
         num_bytes = (
             sum(field.length for field in self.header.fields)
             + 1

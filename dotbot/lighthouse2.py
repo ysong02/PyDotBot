@@ -33,7 +33,7 @@ else:
     LIB_EXT = "so"
 
 LH2_LIB_PATH = os.path.join(os.path.dirname(__file__), "lib", f"lh2.{LIB_EXT}")
-LH2_LIB = CDLL(LH2_LIB_PATH)
+#LH2_LIB = CDLL(LH2_LIB_PATH)
 REFERENCE_POINTS_DEFAULT = [
     [-0.1, 0.1],
     [0.1, 0.1],
