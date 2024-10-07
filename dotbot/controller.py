@@ -15,6 +15,7 @@ import webbrowser
 from binascii import hexlify
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+import cbor2
 # edhoc
 import random
 import lakers
@@ -23,6 +24,7 @@ import requests
 import serial
 import uvicorn
 import websockets
+
 from fastapi import WebSocket
 from haversine import Unit, haversine
 from pydantic import ValidationError
@@ -660,6 +662,7 @@ class Controller:
         #edhoc_ead_authenticator = lakers.AuthzAutenticator()
         #loc_w, voucher_request = edhoc_ead_authenticator.process_ead_1(ead_1, message_1)
         attestation_proposal = ead_1.value()
+        c_r = random.randint(0, 23)  # already cbor-encoded as single-byte integer
         loc_verifier = "http://127.0.0.1:18000"
         attestation_proposal_url = f"{loc_verifier}/.well-known/lake-ra/attestation-proposal"
         self.logger.info(
@@ -667,7 +670,9 @@ class Controller:
             url=attestation_proposal_url,
             attestation_proposal=attestation_proposal.hex(" ").upper(),
         )
-        response = requests.post(attestation_proposal_url, data=attestation_proposal)
+
+        payload = cbor2.dumps([c_r, attestation_proposal])
+        response = requests.post(attestation_proposal_url, data = payload)
         if response.status_code == 200:
             self.logger.info(
                 "Got an ok attestation request",
@@ -677,7 +682,7 @@ class Controller:
             ead_2 = lakers.EADItem(1, True, response.content)
             self.logger.debug(f"ead_2 is prepared: {ead_2.value()}")
 
-            c_r = random.randint(0, 23)  # already cbor-encoded as single-byte integer
+            
             message_2 = edhoc_responder.prepare_message_2(
                 lakers.CredentialTransfer.ByValue, [c_r], ead_2
             )
@@ -716,8 +721,10 @@ class Controller:
         dotbot: DotBotModel,
         edhoc_responder: lakers.EdhocResponder,
         ead_3: bytes,
+        c_r: int,
     ):
         attestation_evidence = ead_3.value()
+        payload = cbor2.dumps([c_r, attestation_evidence])
 
         loc_verifier = "http://127.0.0.1:18000"
         attestation_evidence_url = f"{loc_verifier}/.well-known/lake-ra/evidence"
@@ -726,7 +733,7 @@ class Controller:
             url=attestation_evidence_url,
             attestation_evidence=attestation_evidence.hex(" ").upper(),
         )
-        response = requests.post(attestation_evidence_url, data=attestation_evidence)
+        response = requests.post(attestation_evidence_url, data= payload)
         if response.status_code == 200:
             self.logger.info(
                 "Got an ok attestation result",
@@ -856,7 +863,7 @@ class Controller:
 
                 asyncio.create_task(
                     self.attestation_evidence_for_dotbot(
-                        dotbot, edhoc_responder, _ead_3
+                        dotbot, edhoc_responder, _ead_3, payload.values.value[0]
                     )
                 )
             else:
