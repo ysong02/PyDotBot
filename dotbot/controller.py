@@ -684,7 +684,8 @@ class Controller:
 
             
             message_2 = edhoc_responder.prepare_message_2(
-                lakers.CredentialTransfer.ByValue, [c_r], ead_2
+                # lakers.CredentialTransfer.ByValue, [c_r], ead_2
+                lakers.CredentialTransfer.ByReference, [c_r], ead_2
             )
             loc_w = "http://127.0.0.1:18000"
             self.pending_edhoc_sessions[dotbot.address] = PendingEdhocSession(
@@ -835,8 +836,10 @@ class Controller:
                 edhoc_responder = self.pending_edhoc_sessions[source].responder
                 id_cred_i, _ead_3 = edhoc_responder.parse_message_3(message_3)
                 logger.debug(
-                    "edhoc_message", message_idx=3, message_value=message_3.hex(" ").upper()
-                    #, ead_3 = _ead_3.value().hex().upper() if _ead_3 else None
+                    "ead_3 value is", ead_3 = _ead_3.value()
+                )
+                logger.debug(
+                    "edhoc_message", message_idx=3, message_value=message_3.hex(" ").upper(), ead_value = _ead_3.value().hex(" ").upper()
                 )
                 try:
                     if id_cred_i[1] == 14: # kccs, indicates a raw public key credential sent by value
