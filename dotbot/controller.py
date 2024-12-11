@@ -735,16 +735,23 @@ class Controller:
             attestation_evidence=attestation_evidence.hex(" ").upper(),
         )
         response = requests.post(attestation_evidence_url, data= payload)
+        
         if response.status_code == 200:
-            self.logger.info(
-                "Got an ok attestation result",
-                attestation_result=response.content.hex(" ").upper(),
-            )
-            self.logger.info ("Remote attestation result: Verified")
+            attestation_result = cbor2.loads(response.content)
+            if attestation_result == 0:
+
+                self.logger.info(
+                    "Attestation result: Accepted!\n\n\n\n\n\n\n\n")
+            elif attestation_result == -1:
+                self.logger.info ("Attestation result: Rejected!\n\n\n\n\n\n\n\n")
+            else:
+                self.logger.info ("Unexpected attestation result", attestation_result = response.content.hex(" ").upper()),
         else:
             self.logger.error(
-                "Error attestation result", status_code=response.status_code
+                "Server returned Error", status_code=response.status_code
             )
+
+
 
 
     def handle_received_payload(
