@@ -22,7 +22,7 @@ def fetch_credential_remotely(loc_w: str, id_cred_i: bytes) -> bytes:
     if res.status_code == 200:
         return res.content
     else:
-        raise Exception(f"Error fetching credential {kid} at {loc_w}")
+        raise Exception(f"Error fetching credential {id_cred_i} at {loc_w}")
 
 
 @dataclass

@@ -33,9 +33,10 @@ class PayloadType(Enum):
     GPS_WAYPOINTS = 9
     SAILBOT_DATA = 10
     CMD_XGO_ACTION = 11
-    INVALID_PAYLOAD = 12  
-    EDHOC_MESSAGE = 13 # Increase each time a new payload type is added
+    INVALID_PAYLOAD = 12                    
+    TDMA = 14
     DOTBOT_SIMULATOR_DATA = 250
+    EDHOC_MESSAGE = 13 # Increase each time a new payload type is added
 
 
 class ApplicationType(IntEnum):
