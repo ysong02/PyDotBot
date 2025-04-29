@@ -24,7 +24,7 @@ import serial
 import uvicorn
 import websockets
 
-from fastapi import WebSocket
+from fastapi import WebSocket, HTTPException
 from haversine import Unit, haversine
 from pydantic import ValidationError
 from pydantic.tools import parse_obj_as
@@ -80,6 +80,11 @@ from dotbot.serial_interface import SerialInterface, SerialInterfaceException
 from dotbot.server import api
 
 from dotbot.authz import fetch_credential_remotely, PendingEdhocSession
+from io import BytesIO
+import hashlib
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 # from dotbot.models import (
 #     DotBotModel,
@@ -100,6 +105,11 @@ V = bytes.fromhex("72cc4761dbd4c78f758931aa589d348d1ef874a7e303ede2f140dcf3e6aa4
 CRED_V = bytes.fromhex(
     "a2026b6578616d706c652e65647508a101a501020241322001215820bbc34960526ea4d32e940cad2a234148ddc21791a12afbcbac93622046dd44f02258204519e257236b2a0ce2023f0931f1f386ca7afda64fcde0108c224c51eabf6072"
 )
+# key pair for ed25519 signature in evidence_generation
+priv_hex = "9e666450dfc2f8380bcb4b718e1a6faee4a28db01ab1bd174e70164568ff3cf5" 
+#"e7489cdd6374ff5a271c208a83aef6c0d9e3f01ff8dd9ec2c3e7e6d5ac098e64"
+pub_hex = "4bef5ae83d1461ca715cd643c607e9371cec17c27d27b6d3ccc5ace843549026" 
+#"7fc8b3b57649d05c92ff0bb41b9c248bdc464ef7683a9fa2d3b4c8a9b6f9c5c7"
 class ControllerException(Exception):
     """Exception raised by Dotbot controllers."""
 
@@ -199,6 +209,10 @@ class Controller:
             SubscriptionModel(topic="/lh2/start", callback=self.on_lh2_start),
         ]
         self.pending_edhoc_sessions: Dict[str, PendingEdhocSession] = {}
+        # for mutual attestation
+        self.nonce_evidence_pp = None
+        # for reassembling edhoc-ra message_3
+        self.edhoc_reassembly_buffers = {}
 
     def on_command_move_raw(self, topic, payload):
         """Called when a move raw command is received."""
@@ -656,40 +670,34 @@ class Controller:
         edhoc_responder: lakers.EdhocResponder,
         ead_1: bytes,
     ):
-        #edhoc_ead_authenticator = lakers.AuthzAutenticator()
-        #loc_w, voucher_request = edhoc_ead_authenticator.process_ead_1(ead_1, message_1)
-        # attestation_proposal = ead_1.value()
+        attestation_proposal = ead_1.value()
         c_r = random.randint(0, 23)  # already cbor-encoded as single-byte integer
-        # loc_verifier = "http://127.0.0.1:18000"
-        # attestation_proposal_url = f"{loc_verifier}/.well-known/lake-ra/attestation-proposal"
-        # self.logger.info(
-        #     "sending attestation proposal",
-        #     url=attestation_proposal_url,
-        #     attestation_proposal=attestation_proposal.hex(" ").upper(),
-        # )
+        loc_verifier = "http://127.0.0.1:18000"
+        attestation_proposal_url = f"{loc_verifier}/.well-known/lake-ra/attestation-proposal"
+        self.logger.info(
+            "sending attestation proposal",
+            url=attestation_proposal_url,
+            attestation_proposal=attestation_proposal.hex(" ").upper(),
+        )
 
-        # payload = cbor2.dumps([c_r, attestation_proposal])
-        # response = requests.post(attestation_proposal_url, data = payload)
-        # if response.status_code == 200:
-        #     self.logger.info(
-        #         "Got an ok attestation request",
-        #         attestation_request=response.content.hex(" ").upper(),
-        #     )
+        payload = cbor2.dumps([c_r, attestation_proposal])
+        response = requests.post(attestation_proposal_url, data = payload)
+        if response.status_code == 200:
+            self.logger.info(
+                "Got an ok attestation request",
+                attestation_request=response.content.hex(" ").upper(),
+            )
             
-        #     ead_2 = lakers.EADItem(1, True, response.content)
-        #     # self.logger.debug(f"ead_2 is prepared: {ead_2.value()}")
-
-        if 1:    
+            ead_2 = lakers.EADItem(1, True, response.content)
+            #self.logger.debug(f"ead_2 is prepared: {ead_2.value()}")
             message_2 = edhoc_responder.prepare_message_2(
                 # lakers.CredentialTransfer.ByValue, [c_r], ead_2
                 # different with lake_authz, lake_ra sends cred by reference
-                # lakers.CredentialTransfer.ByReference, [c_r], ead_2
                 #lakers.CredentialTransfer.ByReference, c_r, ead_2
-                lakers.CredentialTransfer.ByReference, [c_r], None
+                lakers.CredentialTransfer.ByReference, [c_r], ead_2
             )
-            loc_w = "http://127.0.0.1:18000"
             self.pending_edhoc_sessions[dotbot.address] = PendingEdhocSession(
-               dotbot, edhoc_responder, loc_w, c_r
+               dotbot, edhoc_responder, loc_verifier, c_r
             )
 
             header = ProtocolHeader(
@@ -710,8 +718,7 @@ class Controller:
                 "Sent EDHOC message 2", message_2=message_2.hex(" ").upper()
             )
             self.logger.debug(
-                "edhoc_message", source=dotbot.address, message_idx=2, message_value=message_2.hex(" ").upper()
-                #, ead_value=ead_2.value().hex(" ").upper()
+                "edhoc_message", source=dotbot.address, message_idx=2, message_value=message_2.hex(" ").upper(), ead_value=ead_2.value().hex(" ").upper()
             )
         else:
             self.logger.error(
@@ -741,13 +748,184 @@ class Controller:
         if response.status_code == 200:
             attestation_result = cbor2.loads(response.content)
             if attestation_result == 0:
-
                 self.logger.info(
                     "Attestation result: Accepted!\n\n\n\n\n\n\n\n")
-                # send message 4
-                ead_4 = lakers.EADItem(1, True, None)
-                message_4 = edhoc_responder.prepare_message_4(ead_4)
+            elif attestation_result == -1:
+                self.logger.info ("Attestation result: Rejected!\n\n\n\n\n\n\n\n")
+            else:
+                self.logger.info ("Unexpected attestation result", attestation_result = response.content.hex(" ").upper())
+            
+        else:
+            self.logger.error(
+                "Server returned Error", status_code=response.status_code
+            )
 
+    async def mutual_attestation_ead_1(
+        self,
+        dotbot: DotBotModel,
+        edhoc_responder: lakers.EdhocResponder,
+        ead_1: bytes,
+    ):
+        ead_1_value = ead_1.value()
+        data = BytesIO(ead_1_value)
+        label_1 = cbor2.load(data)
+        attestation_proposal_decoded = cbor2.load(data)
+        attestation_proposal = cbor2.dumps(attestation_proposal_decoded)
+        label_2 = cbor2.load(data)
+        trigger_pp = cbor2.load(data)
+        if (label_1 == 1 and label_2 == 2 and trigger_pp == None):
+            c_r = random.randint(0, 23)  # already cbor-encoded as single-byte integer
+            loc_verifier = "http://127.0.0.1:18000"
+            attestation_proposal_url = f"{loc_verifier}/.well-known/lake-ra/mutual-ead-1"
+            self.logger.info(
+                "sending attestation proposal and requiring nonce_evidence_pp",
+                url=attestation_proposal_url,
+                attestation_proposal=attestation_proposal.hex(" ").upper(),
+            )
+
+            payload = cbor2.dumps([c_r, attestation_proposal])
+            response = requests.post(attestation_proposal_url, data = payload)
+            if response.status_code == 200:
+                self.logger.info(
+                    "Got an ok attestation request",
+                    attestation_request=response.content.hex(" ").upper(),
+                )
+                data = BytesIO(response.content)
+                _ead_2_verifier = cbor2.load(data)
+                self.nonce_evidence_pp = cbor2.load(data)
+                self.logger.info("ead_2_bg and nonce_evidence_pp is ", ead_2_bg = _ead_2_verifier, nonce_evidence_pp = self.nonce_evidence_pp)
+                result_proposal_data = [{4:1}]
+                result_proposal = cbor2.dumps(result_proposal_data)
+                ead_2_data = cbor2.dumps(1) + cbor2.dumps(_ead_2_verifier) + cbor2.dumps(2) + result_proposal
+                # mutual attestation label is 3
+                ead_2 = lakers.EADItem(3, True, ead_2_data)
+                message_2 = edhoc_responder.prepare_message_2(
+                    # lakers.CredentialTransfer.ByValue, [c_r], ead_2
+                    # different with lake_authz, lake_ra sends cred by reference
+                    #lakers.CredentialTransfer.ByReference, c_r, ead_2
+                    lakers.CredentialTransfer.ByReference, [c_r], ead_2
+                )
+                self.pending_edhoc_sessions[dotbot.address] = PendingEdhocSession(
+                dotbot, edhoc_responder, loc_verifier, c_r
+                )
+
+                header = ProtocolHeader(
+                    destination=int(dotbot.address, 16),
+                    source=int(self.settings.gw_address, 16),
+                    swarm_id=int(self.settings.swarm_id, 16),
+                    application=dotbot.application,
+                    version=PROTOCOL_VERSION,
+                )
+                self.send_payload_to_pending(
+                    ProtocolPayload(
+                        header,
+                        PayloadType.EDHOC_MESSAGE,
+                        EdhocMessage(value=message_2),
+                    )
+                )
+                self.logger.debug(
+                    "Sent EDHOC message 2", message_2=message_2.hex(" ").upper()
+                )
+                self.logger.debug(
+                    "edhoc_message", source=dotbot.address, message_idx=2, message_value=message_2.hex(" ").upper(), ead_value=ead_2.value().hex(" ").upper()
+                )
+            else:
+                self.logger.error("prepare message 2 failed")
+        else:
+            self.logger.error(
+                "wrong label or the content of trigger_pp should be empty"
+                # "Error attestation request", status_code=response.status_code
+            )
+
+    async def evidence_generation (self, file_path):
+        h = hashlib.new('sha256')
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8192):
+                h.update(chunk)
+        file_hash = h.digest()
+        self.logger.info("controller's evidence is", file_hash = file_hash.hex(" ").upper())
+        coswid_payload = {
+            3:{
+                17:[{
+                    7:[
+                        1, file_hash
+                    ]}
+                ]
+            }
+        }
+        token_payload = {
+            256:'controller',
+            10: self.nonce_evidence_pp,
+            273:[[258, coswid_payload]]
+        }
+        self.logger.info("nonce_pp is", nonce_pp = self.nonce_evidence_pp)
+        cbor_token_payload = cbor2.dumps(token_payload)
+        protected = cbor2.dumps({1:-8})
+        
+        #prepare the signature of cose_sign1
+        sig_structure = [
+            "Signature1", protected, b"", cbor_token_payload
+        ]
+        cbor_sig_structure = cbor2.dumps(sig_structure)
+        print(cbor_sig_structure.hex(" "))
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+        signature = private_key.sign(cbor_sig_structure)
+
+        # assemble to be a cose_sign1
+        cose_sign1 = [
+            protected,
+            {},
+            cbor_token_payload,
+            signature
+        ]
+        tagged_cose = cbor2.dumps(cbor2.CBORTag(18, cose_sign1))
+        return tagged_cose
+    
+    async def mutual_attestation_ead_3(
+        self,
+        dotbot: DotBotModel,
+        edhoc_responder: lakers.EdhocResponder,
+        ead_3: bytes,
+        c_r: int,
+    ):  
+        ead_3_value = ead_3.value()
+        fp = BytesIO(ead_3_value)
+        label_1 = cbor2.load(fp)
+        attestation_evidence_decoded = cbor2.load(fp)
+        attestation_evidence = cbor2.dumps(attestation_evidence_decoded)
+        label_2 = cbor2.load(fp)
+        verifierid = cbor2.load(fp)
+        # add nonce check later
+        nonce_result_pp = cbor2.load(fp)
+
+        # the location of controller.py
+        file_path = "C:\\Users\\yusong\\Downloads\\test-edhoc-handshake\\PyDotBot\\dotbot\\controller.py"
+        # call function to generate the evidence of the controller
+        tagged_cose = await self.evidence_generation(file_path)
+        # send to the verifier, c_r (gonna delete this later), evidence of the dotbot, evidence of the controller, nonce for generating attestation result
+        payload = cbor2.dumps([c_r, attestation_evidence, tagged_cose, nonce_result_pp])
+        loc_verifier = "http://127.0.0.1:18000"
+        attestation_evidence_url = f"{loc_verifier}/.well-known/lake-ra/mutual-evidence"
+        self.logger.info(
+            "sending two pieces of Evidence in bg and pp model",
+            url=attestation_evidence_url,
+            attestation_evidence=attestation_evidence.hex(" ").upper(),
+            controller_evidence=tagged_cose.hex(" ").upper(),
+        )
+        response = requests.post(attestation_evidence_url, data= payload)
+        
+        if response.status_code == 200:
+            data = BytesIO(response.content)
+            result_bg = cbor2.load(data)
+            result_pp = cbor2.load(data)
+            #attestation_result = cbor2.loads(response.content)
+            if result_bg == 0:
+                self.logger.info("Attestation result: Accepted!\n\n")
+                self.logger.info("result_pp from the verifier is", result_pp = cbor2.dumps(result_pp).hex(" "))
+                self.serial.serial.reset_input_buffer()
+                # send message 4
+                ead_4 = lakers.EADItem(3, True, cbor2.dumps(result_pp))
+                message_4 = edhoc_responder.prepare_message_4(ead_4)
                 header = ProtocolHeader(
                 destination=int(dotbot.address, 16),
                 source=int(self.settings.gw_address, 16),
@@ -764,54 +942,33 @@ class Controller:
                     )
                 )
                 self.logger.debug(
-                    "Sent EDHOC message 4", message_4=message_4.hex(" ").upper()
+                    "Sent EDHOC message 4", message_4=message_4.hex(" ").upper(), ead_value = ead_4.value().hex(" ")
                 )
-                self.logger.debug(
-                    "edhoc_message", source=dotbot.address, message_idx=4, message_value=message_4.hex(" ").upper(), ead_value=ead_4.value().hex(" ").upper()
-                )
-            elif attestation_result == -1:
-                self.logger.info ("Attestation result: Rejected!\n\n\n\n\n\n\n\n")
+                time.sleep(0.5)
+                # self.pending_edhoc_sessions.pop(source)
+                # dotbot.status = DotBotStatus.DEAD
+                # del self.edhoc_reassembly_buffers[source]
+                self.logger.info("Dotbot handshake finished and should be cleaned up.")
+                # self.serial.serial.reset_input_buffer()
+                # self.logger.debug(
+                #     "edhoc_message", source=dotbot.address, message_idx=4, message_value=message_4.hex(" ").upper(), ead_value=ead_4.value().hex(" ").upper()
+                # )
+            elif result_bg == -1:
+                self.logger.info ("Attestation result: Rejected!\n\n")
             else:
                 self.logger.info ("Unexpected attestation result", attestation_result = response.content.hex(" ").upper())
-            
-            # # send message 4
-            # self.logger.info("Preparing ead 4")
-            # ead_4 = lakers.EADItem(1, True, None)
-            # self.logger.info("Preparing message 4")
-            # message_4 = edhoc_responder.prepare_message_4()
-
-            # header = ProtocolHeader(
-            # destination=int(dotbot.address, 16),
-            # source=int(self.settings.gw_address, 16),
-            # swarm_id=int(self.settings.swarm_id, 16),
-            # application=dotbot.application,
-            # version=PROTOCOL_VERSION,
-            # )
-
-            # self.send_payload_to_pending(
-            #     ProtocolPayload(
-            #         header,
-            #         PayloadType.EDHOC_MESSAGE,
-            #         EdhocMessage(value=message_4),
-            #     )
-            # )
-            # self.logger.debug(
-            #     "Sent EDHOC message 4", message_4=message_4.hex(" ").upper()
-            # )
-            # self.logger.debug(
-            #     "edhoc_message", source=dotbot.address, message_idx=4, message_value=message_4.hex(" ").upper(), ead_value=ead_4.value().hex(" ").upper()
-            # )
         else:
             self.logger.error(
                 "Server returned Error", status_code=response.status_code
             )
-
+    
 
 
     def handle_received_payload(
         self, payload: ProtocolPayload
     ):  # pylint:disable=too-many-branches,too-many-statements
         """Handle a received payload."""
+        
         # Controller is not interested by command messages received
         if payload.payload_type in [
             PayloadType.CMD_MOVE_RAW,
@@ -857,120 +1014,248 @@ class Controller:
                 logger.debug(
                     "edhoc_message", message_idx=1, message_value=message_1.hex(" ").upper()
                 )
+                logger.debug(
+                    "ead_1", ead_1_value = ead_1.value()
+                )
                 
             except Exception as e:
                 logger.error("Error processing message 1", error=e)
                 return
-            #if ead_1 and ead_1.label() == lakers.consts.EAD_AUTHZ_LABEL:
-            # if ead_1 and ead_1.label() == 1:
-
-            #     asyncio.create_task(
-            #         self.attestation_proposal_for_dotbot(
-            #             dotbot, edhoc_responder, ead_1
-            #         )
-            #     )
-            #     return
-            # else:
-            #     logger.error("EDHOC message 1 should contain a valid EAD_1")
-            #    return
-            asyncio.create_task(
-    
-                self.attestation_proposal_for_dotbot(
-                    dotbot, edhoc_responder, ead_1
+            # if ead_1 and ead_1.label() == lakers.consts.EAD_AUTHZ_LABEL:
+            if ead_1 and ead_1.label() == 1:
+                asyncio.create_task(
+                    self.attestation_proposal_for_dotbot(
+                        dotbot, edhoc_responder, ead_1
+                    )
                 )
-            )
-            return
+                return
+            if ead_1 and ead_1.label() == 3:
+                asyncio.create_task(    
+                    self.mutual_attestation_ead_1(
+                        dotbot, edhoc_responder, ead_1
+                    )
+                )
+                return
+            else:
+                logger.error("EDHOC message 1 should contain a valid EAD_1")
+                return
+
 
         elif (
-            (
-                source not in self.dotbots
-                or self.dotbots[source].status in [DotBotStatus.LOST, DotBotStatus.DEAD]
-            )
-            and source in self.pending_edhoc_sessions
+            # (
+            #     source not in self.dotbots
+            #     or self.dotbots[source].status in [DotBotStatus.LOST, DotBotStatus.DEAD]
+            # )
+            source in self.pending_edhoc_sessions
             # if EDHOC message has been received before, then this should be msg_3
             and payload.payload_type == PayloadType.EDHOC_MESSAGE
         ):
             logger.info("Potential EDHOC message 3")
             try:
                 # check connection identifier
-                assert (
-                    payload.values.value[0] == self.pending_edhoc_sessions[source].c_r
-                )
+                # assert (
+                #     payload.values.value[0] == self.pending_edhoc_sessions[source].c_r
+                # )
+                fragment_flag = payload.values.value[0]
+                c_r = payload.values.value[1]
+                fragment_payload = payload.values.value[2:]
                 # delete the debug message later
-                # logger.debug(
-                #     "payload value c_r and pending session c_r", payload_cr = payload.values.value[0], local_session_cr = self.pending_edhoc_sessions[source].c_r 
-                # )
-                message_3 = payload.values.value[1:]
-                # logger.debug(
-                #     "Will process EDHOC message 3", message_3=message_3.hex(" ").upper()
-                # )
-                edhoc_responder = self.pending_edhoc_sessions[source].responder        
- 
-                id_cred_i, _ead_3 = edhoc_responder.parse_message_3(message_3)
-                # logger.debug(
-                #     "ead_3 value is", ead_3 = _ead_3.value()
-                # )
                 logger.debug(
-                    "edhoc_message", message_idx=3, message_value=message_3.hex(" ").upper()
-                    # , ead_value = _ead_3.value().hex(" ").upper()
+                    "payload value c_r and pending session c_r", payload_cr = payload.values.value[1], local_session_cr = self.pending_edhoc_sessions[source].c_r 
                 )
+                assert (
+                    payload.values.value[1] == self.pending_edhoc_sessions[source].c_r
+                )
+                # message_3 = payload.values.value[1:]
                 
-                try:
-                    if id_cred_i[1] == 14: # kccs, indicates a raw public key credential sent by value
-                        cred_i = id_cred_i[2:]
+                if fragment_flag == 0x01: 
+                    logger.info("Received start fragment")
+                    self.edhoc_reassembly_buffers[source] = BytesIO()
+                    self.edhoc_reassembly_buffers[source].write(fragment_payload)
+                    self.edhoc_reassembly_buffers[source].c_r = c_r
+
+                elif fragment_flag == 0x02: 
+                    logger.info("Received middle fragment")
+                    if source not in self.edhoc_reassembly_buffers:
+                        logger.error("Middle fragment but no start fragment!")
+                        return
+                    self.edhoc_reassembly_buffers[source].write(fragment_payload)
+
+                elif fragment_flag == 0x03: 
+                    logger.info("Received end fragment")
+                    if source not in self.edhoc_reassembly_buffers:
+                        logger.error("End fragment but no start fragment!")
+                        return
+                    self.edhoc_reassembly_buffers[source].write(fragment_payload)
+
+                    # Now process full message
+                    full_message = self.edhoc_reassembly_buffers[source].getvalue()
+                    full_c_r = self.edhoc_reassembly_buffers[source].c_r
+                    logger.info(f"Reassembled EDHOC message 3 of {len(full_message)} bytes")
+                    # # Process full reassembled message_3
+                    # self._handle_full_edhoc_message(source, full_c_r, full_message)
+                    message_3 = full_message
+                    # logger.debug(
+                    #     "Will process EDHOC message 3", message_3=message_3.hex(" ").upper()
+                    # )
+                    edhoc_responder = self.pending_edhoc_sessions[source].responder        
+
+                    id_cred_i, _ead_3 = edhoc_responder.parse_message_3(message_3)
+                    logger.debug(
+                        "edhoc_message", message_idx=3, message_value=message_3.hex(" ").upper(), ead_value = _ead_3.value().hex(" ").upper()
+                    )
+                    
+                    try:
+                        if id_cred_i[1] == 14: # kccs, indicates a raw public key credential sent by value
+                            cred_i = id_cred_i[2:]
+                        else:
+                            self.pending_edhoc_sessions[source].loc_w = "http://127.0.0.1:18000"
+                            cred_i = fetch_credential_remotely(
+                                self.pending_edhoc_sessions[source].loc_w, id_cred_i)
+                    except Exception as e:
+                        logger.error("Error fetching credential", error=e)
+                        self.pending_edhoc_sessions.pop(source)
+                        dotbot.status = DotBotStatus.DEAD
+                        return
+                    r_prk_out = edhoc_responder.verify_message_3(cred_i)
+                    logger.info("EDHOC handshake worked")
+                    logger.debug("Derived prk_out", prk_out=r_prk_out.hex(" ").upper())
+
+                    if (_ead_3 == None):
+                        logger.info("ead 3 is empty")
+                        message_4 = edhoc_responder.prepare_message_4(None)
+                        header = ProtocolHeader(
+                        destination=int(dotbot.address, 16),
+                        source=int(self.settings.gw_address, 16),
+                        swarm_id=int(self.settings.swarm_id, 16),
+                        application=dotbot.application,
+                        version=PROTOCOL_VERSION,
+                        )
+
+                        self.send_payload_to_pending(
+                            ProtocolPayload(
+                                header,
+                                PayloadType.EDHOC_MESSAGE,
+                                EdhocMessage(value=message_4),
+                            )
+                        )
+                        self.logger.debug("Sent EDHOC message 4")
+                        logger.debug(
+                            "edhoc_message", message_idx=4, message_value=message_4.hex(" ").upper()
+                            )                               
+                    if _ead_3 and _ead_3.label() == 1:
+                        logger.info("single direction attestation, handling ead_3 evidence")
+                        asyncio.create_task(
+                            self.attestation_evidence_for_dotbot(
+                                dotbot, edhoc_responder, _ead_3, payload.values.value[0]
+                            )
+                        )
+                    if _ead_3.label() == 3:
+                        logger.info("mutual attestation, handling ead_3: evidence and result request")
+                        asyncio.create_task(
+                            self.mutual_attestation_ead_3(dotbot, edhoc_responder, _ead_3, full_c_r)
+                        )
+                    
                     else:
-                        self.pending_edhoc_sessions[source].loc_w = "http://127.0.0.1:18000"
-                        cred_i = fetch_credential_remotely(
-                            self.pending_edhoc_sessions[source].loc_w, id_cred_i)
-                except Exception as e:
-                    logger.error("Error fetching credential", error=e)
-                    self.pending_edhoc_sessions.pop(source)
-                    dotbot.status = DotBotStatus.DEAD
-                    return
-                r_prk_out = edhoc_responder.verify_message_3(cred_i)
-                logger.info("EDHOC handshake worked")
-                logger.debug("Derived prk_out", prk_out=r_prk_out.hex(" ").upper())
+                        logger.error("EDHOC message 3 should contain a valid EAD_3")
+                        return
+                else:
+                    logger.error(f"Unknown fragment flag {fragment_flag}")
             except Exception as e:
                 logger.error("Error processing message 3", error=e)
-                self.pending_edhoc_sessions.pop(source)
-                dotbot.status = DotBotStatus.DEAD
+                # self.pending_edhoc_sessions.pop(source)
+                # dotbot.status = DotBotStatus.DEAD
                 return
             
-            message_4 = edhoc_responder.prepare_message_4(None)
-            # if _ead_3 and _ead_3.label() == 1:
+                            
+            #logger.info("New dotbot")
+            
+            # NOTE: could save self.pending_edhoc_sessions[source].responder state for future use, e.g. to derive OSCORE keys
+            # self.pending_edhoc_sessions.pop(source)
+            # dotbot.status = DotBotStatus.DEAD
 
+                    # Clear buffer
+            #del self.edhoc_reassembly_buffers[source]
+
+                
+            #     message_3 = full_message
+            #     # logger.debug(
+            #     #     "Will process EDHOC message 3", message_3=message_3.hex(" ").upper()
+            #     # )
+            #     edhoc_responder = self.pending_edhoc_sessions[source].responder        
+
+            #     id_cred_i, _ead_3 = edhoc_responder.parse_message_3(message_3)
+            #     logger.debug(
+            #         "ead_3 value is", ead_3 = _ead_3.value()
+            #     )
+            #     logger.debug(
+            #         "edhoc_message", message_idx=3, message_value=message_3.hex(" ").upper(), ead_value = _ead_3.value().hex(" ").upper()
+            #     )
+                
+            #     try:
+            #         if id_cred_i[1] == 14: # kccs, indicates a raw public key credential sent by value
+            #             cred_i = id_cred_i[2:]
+            #         else:
+            #             self.pending_edhoc_sessions[source].loc_w = "http://127.0.0.1:18000"
+            #             cred_i = fetch_credential_remotely(
+            #                 self.pending_edhoc_sessions[source].loc_w, id_cred_i)
+            #     except Exception as e:
+            #         logger.error("Error fetching credential", error=e)
+            #         self.pending_edhoc_sessions.pop(source)
+            #         dotbot.status = DotBotStatus.DEAD
+            #         return
+            #     r_prk_out = edhoc_responder.verify_message_3(cred_i)
+            #     logger.info("EDHOC handshake worked")
+            #     logger.debug("Derived prk_out", prk_out=r_prk_out.hex(" ").upper())
+            # except Exception as e:
+            #     logger.error("Error processing message 3", error=e)
+            #     self.pending_edhoc_sessions.pop(source)
+            #     dotbot.status = DotBotStatus.DEAD
+            #     return
+            # if (_ead_3 == None):
+            #     logger.info("ead 3 is empty")
+            #     message_4 = edhoc_responder.prepare_message_4(None)
+            #     header = ProtocolHeader(
+            #     destination=int(dotbot.address, 16),
+            #     source=int(self.settings.gw_address, 16),
+            #     swarm_id=int(self.settings.swarm_id, 16),
+            #     application=dotbot.application,
+            #     version=PROTOCOL_VERSION,
+            #     )
+
+            #     self.send_payload_to_pending(
+            #         ProtocolPayload(
+            #             header,
+            #             PayloadType.EDHOC_MESSAGE,
+            #             EdhocMessage(value=message_4),
+            #         )
+            #     )
+            #     self.logger.debug("Sent EDHOC message 4")
+            #     logger.debug(
+            #         "edhoc_message", message_idx=4, message_value=message_4.hex(" ").upper()
+            #         )                               
+            # if _ead_3 and _ead_3.label() == 1:
+            #     logger.info("single direction attestation, handling ead_3 evidence")
             #     asyncio.create_task(
             #         self.attestation_evidence_for_dotbot(
             #             dotbot, edhoc_responder, _ead_3, payload.values.value[0]
             #         )
             #     )
+            # if _ead_3.label() == 3:
+            #     logger.info("mutual attestation, handling ead_3: evidence and result request")
+            #     asyncio.create_task(
+            #         self.mutual_attestation_ead_3(dotbot, edhoc_responder, _ead_3, payload.values.value[0])
+            #     )
+            
             # else:
             #     logger.error("EDHOC message 3 should contain a valid EAD_3")
             #     return
-            header = ProtocolHeader(
-            destination=int(dotbot.address, 16),
-            source=int(self.settings.gw_address, 16),
-            swarm_id=int(self.settings.swarm_id, 16),
-            application=dotbot.application,
-            version=PROTOCOL_VERSION,
-            )
-
-            self.send_payload_to_pending(
-                ProtocolPayload(
-                    header,
-                    PayloadType.EDHOC_MESSAGE,
-                    EdhocMessage(value=message_4),
-                )
-            )
-            self.logger.debug("Sent EDHOC message 4")
-            logger.debug(
-                "edhoc_message", message_idx=4, message_value=message_4.hex(" ").upper()
-                )
-            logger.info("New dotbot")
+                            
+            # logger.info("New dotbot")
             
-            # NOTE: could save self.pending_edhoc_sessions[source].responder state for future use, e.g. to derive OSCORE keys
-            self.pending_edhoc_sessions.pop(source)
-            dotbot.status = DotBotStatus.DEAD
+            # # NOTE: could save self.pending_edhoc_sessions[source].responder state for future use, e.g. to derive OSCORE keys
+            # self.pending_edhoc_sessions.pop(source)
+            # dotbot.status = DotBotStatus.DEAD
             # notification_cmd = DotBotNotificationCommand.RELOAD
         elif source in self.dotbots:
             dotbot.mode = self.dotbots[source].mode
