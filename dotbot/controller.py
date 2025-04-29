@@ -680,7 +680,7 @@ class Controller:
             attestation_proposal=attestation_proposal.hex(" ").upper(),
         )
 
-        payload = cbor2.dumps([c_r, attestation_proposal])
+        payload = cbor2.dumps(attestation_proposal)
         response = requests.post(attestation_proposal_url, data = payload)
         if response.status_code == 200:
             self.logger.info(
@@ -734,7 +734,7 @@ class Controller:
         c_r: int,
     ):
         attestation_evidence = ead_3.value()
-        payload = cbor2.dumps([c_r, attestation_evidence])
+        payload = cbor2.dumps(attestation_evidence)
 
         loc_verifier = "http://127.0.0.1:18000"
         attestation_evidence_url = f"{loc_verifier}/.well-known/lake-ra/evidence"
@@ -783,7 +783,7 @@ class Controller:
                 attestation_proposal=attestation_proposal.hex(" ").upper(),
             )
 
-            payload = cbor2.dumps([c_r, attestation_proposal])
+            payload = cbor2.dumps(attestation_proposal)
             response = requests.post(attestation_proposal_url, data = payload)
             if response.status_code == 200:
                 self.logger.info(
@@ -903,7 +903,7 @@ class Controller:
         # call function to generate the evidence of the controller
         tagged_cose = await self.evidence_generation(file_path)
         # send to the verifier, c_r (gonna delete this later), evidence of the dotbot, evidence of the controller, nonce for generating attestation result
-        payload = cbor2.dumps([c_r, attestation_evidence, tagged_cose, nonce_result_pp])
+        payload = cbor2.dumps([attestation_evidence, tagged_cose, nonce_result_pp])
         loc_verifier = "http://127.0.0.1:18000"
         attestation_evidence_url = f"{loc_verifier}/.well-known/lake-ra/mutual-evidence"
         self.logger.info(
